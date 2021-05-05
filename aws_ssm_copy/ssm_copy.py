@@ -1,6 +1,7 @@
 import argparse
 import re
 import sys
+import csv
 
 import boto3
 from botocore.exceptions import ClientError
@@ -54,6 +55,14 @@ def rename_parameter(parameter, source_path, target_path):
 
     return result
 
+def get_new_names(parameter, mapping):
+    result = []
+    name = parameter["Name"]
+    for map in mapping:
+        if name.endswith(map[0]):
+            result.append(name.replace(map[0], map[1]))
+            sys.stdout.write(f"DEBUG: parameter {name} will be copying to {result[-1]}\n")
+    return result
 
 class ParameterCopier(object):
     def __init__(self):
@@ -66,6 +75,7 @@ class ParameterCopier(object):
         self.target_ssm = None
         self.target_sts = None
         self.target_path = None
+        self.param_map = None
         self.dry_run = False
 
     @staticmethod
@@ -84,6 +94,20 @@ class ParameterCopier(object):
     def connect_to_target(self, profile, region):
         self.target_ssm = self.connect_to(profile, region).client("ssm")
         self.target_sts = self.connect_to(profile, region).client("sts")
+
+    def load_param_map(self, csv_file):
+        if csv_file:
+            with open(csv_file, mode='r') as csv_file:
+                sys.stdout.write(f"INFO: parameter mapping defined in {csv_file} will be used,\n")
+                sys.stdout.write(f"INFO: <original name> -> \t<target name>\n")
+                csv_reader = csv.reader(csv_file, delimiter=',')
+                line_count = 0
+                self.param_map = []
+                for row in csv_reader:
+                    sys.stdout.write(f"INFO: {row[0]} -> \t{row[1]}\n")
+                    self.param_map.append(row)
+                    line_count += 1
+                sys.stdout.write(f"INFO: Readed {line_count} mapping lines. Mapping: {self.param_map}\n")
 
     def load_source_parameters(self, arg, recursive, one_level):
         result = {}
@@ -141,31 +165,38 @@ class ParameterCopier(object):
                         del parameter["Policies"]
                 parameter["Overwrite"] = overwrite
                 parameter = rename_parameter(parameter, arg, self.target_path)
-                new_name = parameter["Name"]
-                if self.dry_run:
-                    sys.stdout.write(f"DRY-RUN: copying {name} to {new_name}\n")
-                else:
-
-                    try:
-                        self.target_ssm.put_parameter(**parameter)
-                        sys.stdout.write(f"INFO: copied {name} to {new_name}\n")
-                    except self.target_ssm.exceptions.ParameterAlreadyExists as e:
-                        if not keep_going:
+                new_names = (parameter["Name"])
+                if self.param_map:
+                    names = get_new_names(parameter, self.param_map)
+                    if len(names) > 0:
+                        new_names = names
+                    else:
+                        sys.stdout.write(f"DEBUG: parameter {name} is skipped because there isn't in the mapping\n")
+                        continue
+                for new_name in new_names:
+                    if self.dry_run:
+                        sys.stdout.write(f"DRY-RUN: copying {name} to {new_name}\n")
+                    else:
+                        try:
+                            self.target_ssm.put_parameter(**parameter)
+                            sys.stdout.write(f"INFO: copied {name} to {new_name}\n")
+                        except self.target_ssm.exceptions.ParameterAlreadyExists as e:
+                            if not keep_going:
+                                sys.stderr.write(
+                                    f"ERROR: failed to copy {name} to {new_name} as it already exists: specify --overwrite or --keep-going\n"
+                                )
+                                exit(1)
+                            else:
+                                sys.stderr.write(
+                                    f"WARN: skipping copy {name} as {new_name} already exists\n"
+                                )
+                        except ClientError as e:
+                            msg = e.response["Error"]["Message"]
                             sys.stderr.write(
-                                f"ERROR: failed to copy {name} to {new_name} as it already exists: specify --overwrite or --keep-going\n"
+                                f"ERROR: failed to copy {name} to {new_name}, {msg}\n"
                             )
-                            exit(1)
-                        else:
-                            sys.stderr.write(
-                                f"WARN: skipping copy {name} as {new_name} already exists\n"
-                            )
-                    except ClientError as e:
-                        msg = e.response["Error"]["Message"]
-                        sys.stderr.write(
-                            f"ERROR: failed to copy {name} to {new_name}, {msg}\n"
-                        )
-                        if not keep_going:
-                            exit(1)
+                            if not keep_going:
+                                exit(1)
 
     def main(self):
         parser = argparse.ArgumentParser(description="copy parameter store ")
@@ -236,6 +267,13 @@ class ParameterCopier(object):
             help="to copy the parameters to",
             metavar="NAME",
         )
+        parser.add_argument(
+            "--param-map",
+            dest="param_map",
+            help="mapping to rename the parameters",
+            metavar="NAME",
+        )
+
         key_group = parser.add_mutually_exclusive_group()
         key_group.add_argument(
             "--key-id",
@@ -258,6 +296,7 @@ class ParameterCopier(object):
         try:
             self.connect_to_source(options.source_profile, options.source_region)
             self.connect_to_target(options.target_profile, options.target_region)
+            self.load_param_map(options.param_map)
             self.target_path = options.target_path
             self.dry_run = options.dry_run
             self.copy(
